@@ -1,21 +1,28 @@
 /*
- * YouTube iOS 首页 Feed Sponsored 广告定向补丁 v2
+ * YouTube iOS 首页 Feed Sponsored 广告定向补丁 v3
  *
- * 依据两份真实 HAR：同一类 Disney+/Hulu 首页广告存在两种 EML 包装：
- *   A: ... -> field #5 -> extension -> field #19 -> ad payload
- *   B: ... -> field #5 -> extension -> field #27 -> ad payload
- * 因此不再绑定 #19/#27，而是在“内容项 field #5”层级上识别广告并删除整个内容项，
- * 避免只删内部 renderer 后残留灰色/空白卡片。
+ * v3 根据 2026-09-02 17:18:57 的真实 HAR 再次修正：
+ * 1. 删除包含 Google/YouTube 广告点击、曝光、About This Ad 标记的 Feed 内容项 field #5；
+ * 2. 同时清除同一响应 field #777 中残留的 EML 广告组件注册表，避免主体删除后仍由 ad_badge / ad_image / feed_ad_metadata 等组件继续渲染或复用缓存广告卡片；
+ * 3. 无广告的 browse 响应保持原样。
  */
 (() => {
-  const MARKERS = [
+  const CORE_MARKERS = [
     'googleadservices.com/pagead/aclk',
     'www.youtube.com/pagead/adview',
     'www.youtube.com/pagead/interaction',
     'www.youtube.com/aboutthisad?pf=ios'
   ];
+  const EML_MARKERS = [
+    'ad_badge.eml-fe',
+    'feed_ad_metadata.eml-fe',
+    'ad_image.eml-fe',
+    'ad_disclosure_banner.eml-fe'
+  ];
+
   const enc = new TextEncoder();
-  const markerBytes = MARKERS.map((s) => enc.encode(s));
+  const coreBytes = CORE_MARKERS.map((s) => enc.encode(s));
+  const emlBytes = EML_MARKERS.map((s) => enc.encode(s));
 
   function readVarint(a, i, end) {
     let v = 0, shift = 0, p = i;
@@ -48,11 +55,18 @@
     return false;
   }
 
-  function isHighConfidenceAdPayload(p) {
-    if (p.length < 512) return false;
+  function markerHits(payload, markers) {
     let hits = 0;
-    for (const m of markerBytes) if (contains(p, m)) hits++;
-    return hits >= 2;
+    for (const m of markers) if (contains(payload, m)) hits++;
+    return hits;
+  }
+
+  function isHighConfidenceAdItem(payload) {
+    return payload.length >= 512 && markerHits(payload, coreBytes) >= 2;
+  }
+
+  function isAdEmlRegistry(payload) {
+    return payload.length >= 512 && markerHits(payload, emlBytes) >= 2;
   }
 
   function concat(parts, total) {
@@ -93,11 +107,12 @@
     }
   }
 
-  function cleanMessage(a, depth = 0) {
+  function cleanMessage(a, depth = 0, inside777 = false) {
     let i = 0;
     const parts = [];
     let total = 0;
-    let localRemoved = 0;
+    let coreRemoved = 0;
+    let emlRemoved = 0;
 
     try {
       while (i < a.length) {
@@ -127,38 +142,50 @@
         if (payloadEnd > a.length) return null;
         const payload = a.slice(lenEnd, payloadEnd);
 
-        // 两份 HAR 中广告内部字段分别变成 #19 / #27，
-        // 但完整 Feed 内容项的外层 field #5 保持一致。
-        if (fieldNo === 5 && isHighConfidenceAdPayload(payload)) {
-          localRemoved++;
-          console.log(`[YT HomeFeed AdBlock v2] remove ad item field #5 at depth ${depth}, ${payload.length} bytes`);
+        // 删除真正的 Sponsored Feed 内容项。
+        if (fieldNo === 5 && isHighConfidenceAdItem(payload)) {
+          coreRemoved++;
+          console.log(`[YT HomeFeed AdBlock v3] remove sponsored field #5 depth=${depth}, bytes=${payload.length}`);
+          i = payloadEnd;
+          continue;
+        }
+
+        // 17:18:57 HAR 证明主体被删后，field #777 中仍残留整套广告 EML 组件。
+        // 只在 #777 子树内且同时命中多个广告组件名称时删除该注册块。
+        if (inside777 && isAdEmlRegistry(payload)) {
+          emlRemoved++;
+          console.log(`[YT HomeFeed AdBlock v3] remove ad EML registry depth=${depth}, field=${fieldNo}, bytes=${payload.length}`);
           i = payloadEnd;
           continue;
         }
 
         let newPayload = payload;
-        let childRemoved = 0;
-        if (depth < 40 && looksLikeMessage(payload)) {
-          const child = cleanMessage(payload, depth + 1);
-          if (child && child.removed > 0) {
+        let childCore = 0;
+        let childEml = 0;
+        if (depth < 50 && looksLikeMessage(payload)) {
+          const child = cleanMessage(payload, depth + 1, inside777 || (depth === 0 && fieldNo === 777));
+          if (child && (child.coreRemoved > 0 || child.emlRemoved > 0)) {
             newPayload = child.bytes;
-            childRemoved = child.removed;
+            childCore = child.coreRemoved;
+            childEml = child.emlRemoved;
           }
         }
 
-        if (childRemoved > 0) {
+        if (childCore > 0 || childEml > 0) {
           const keyBytes = a.slice(fieldStart, keyEnd);
           const lenBytes = writeVarint(newPayload.length);
           parts.push(keyBytes, lenBytes, newPayload);
           total += keyBytes.length + lenBytes.length + newPayload.length;
-          localRemoved += childRemoved;
+          coreRemoved += childCore;
+          emlRemoved += childEml;
         } else {
           const raw = a.slice(fieldStart, payloadEnd);
           parts.push(raw); total += raw.length;
         }
         i = payloadEnd;
       }
-      return { bytes: concat(parts, total), removed: localRemoved };
+
+      return { bytes: concat(parts, total), coreRemoved, emlRemoved };
     } catch (_) {
       return null;
     }
@@ -168,17 +195,18 @@
     const input = $response.body instanceof Uint8Array
       ? $response.body
       : new Uint8Array($response.body);
-    const result = cleanMessage(input, 0);
 
-    if (result && result.removed > 0) {
-      console.log(`[YT HomeFeed AdBlock v2] removed ${result.removed} sponsored item(s), ${input.length} -> ${result.bytes.length} bytes`);
+    const result = cleanMessage(input, 0, false);
+
+    if (result && (result.coreRemoved > 0 || result.emlRemoved > 0)) {
+      console.log(`[YT HomeFeed AdBlock v3] DONE core=${result.coreRemoved}, eml=${result.emlRemoved}, ${input.length} -> ${result.bytes.length} bytes`);
       $done({ body: result.bytes });
     } else {
-      console.log('[YT HomeFeed AdBlock v2] no matching sponsored item found');
+      console.log('[YT HomeFeed AdBlock v3] PASS no sponsored item');
       $done({});
     }
   } catch (e) {
-    console.log(`[YT HomeFeed AdBlock v2] error: ${e}`);
+    console.log(`[YT HomeFeed AdBlock v3] ERROR ${e}`);
     $done({});
   }
 })();
