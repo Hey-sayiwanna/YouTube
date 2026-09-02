@@ -1,10 +1,12 @@
 /*
- * YouTube iOS 首页 Feed Sponsored 广告定向补丁 v4
+ * YouTube iOS 首页 Feed Sponsored 广告定向补丁 v5
  *
- * v4 根据 2026-09-02 多份真实 HAR 修正 v2/v3 的“删得过大”问题：
- * - 不再删除整个 Feed 外层 field #5，也不再删除 field #777 EML 注册表；
+ * v5 修复 Surge JSC 环境没有 TextEncoder 导致脚本直接 Abort 的问题。
+ * 过滤策略沿用 v4：
+ * - 不把 /browse 整体返回 0；
+ * - 不删除整页 Feed 外层大容器；
  * - 仅递归删除 <= 40 KB 且同时命中 >= 2 个强广告端点标记的 protobuf 子消息；
- * - 这样可删除 Disney+/Hulu、ANEXT 等广告的实际创意/点击/曝光子块，同时保留 Feed 外层容器，避免 YouTube 因响应过空而回退到旧缓存内容。
+ * - 标记均为 ASCII，使用手写 ASCII -> Uint8Array 转换，兼容 Surge JSC。
  */
 (() => {
   const MAX_AD_NODE_SIZE = 40 * 1024;
@@ -15,8 +17,13 @@
     'www.youtube.com/aboutthisad?pf=ios'
   ];
 
-  const enc = new TextEncoder();
-  const markerBytes = CORE_MARKERS.map((s) => enc.encode(s));
+  function asciiBytes(s) {
+    const out = new Uint8Array(s.length);
+    for (let i = 0; i < s.length; i++) out[i] = s.charCodeAt(i) & 0xff;
+    return out;
+  }
+
+  const markerBytes = CORE_MARKERS.map(asciiBytes);
 
   function readVarint(a, i, end) {
     let v = 0, shift = 0, p = i;
@@ -128,13 +135,11 @@
         if (payloadEnd > a.length) return null;
         const payload = a.slice(lenEnd, payloadEnd);
 
-        // 核心策略：只删除“中小型、强广告证据”的子消息。
-        // 不再删除 40 KB 以上的大容器，避免把整页 Feed 一起砍掉。
         if (payload.length <= MAX_AD_NODE_SIZE) {
           const hits = markerHits(payload);
           if (hits >= 2) {
             removed++;
-            console.log(`[YT HomeFeed AdBlock v4] PRUNE field=${fieldNo} depth=${depth} bytes=${payload.length} hits=${hits}`);
+            console.log(`[YT HomeFeed AdBlock v5] PRUNE field=${fieldNo} depth=${depth} bytes=${payload.length} hits=${hits}`);
             i = payloadEnd;
             continue;
           }
@@ -174,17 +179,18 @@
       ? $response.body
       : new Uint8Array($response.body);
 
+    console.log(`[YT HomeFeed AdBlock v5] START bytes=${input.length}`);
     const result = cleanMessage(input, 0);
 
     if (result && result.removed > 0) {
-      console.log(`[YT HomeFeed AdBlock v4] DONE removed=${result.removed}, ${input.length} -> ${result.bytes.length} bytes`);
+      console.log(`[YT HomeFeed AdBlock v5] DONE removed=${result.removed}, ${input.length} -> ${result.bytes.length} bytes`);
       $done({ body: result.bytes });
     } else {
-      console.log(`[YT HomeFeed AdBlock v4] PASS no ad node, bytes=${input.length}`);
+      console.log(`[YT HomeFeed AdBlock v5] PASS no ad node, bytes=${input.length}`);
       $done({});
     }
   } catch (e) {
-    console.log(`[YT HomeFeed AdBlock v4] ERROR ${e}`);
+    console.log(`[YT HomeFeed AdBlock v5] ERROR ${e}`);
     $done({});
   }
 })();
