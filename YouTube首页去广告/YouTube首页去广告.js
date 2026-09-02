@@ -1,16 +1,23 @@
 /*
- * YouTube iOS 首页 Feed Sponsored 广告补丁 v7
+ * YouTube iOS 首页 Feed Sponsored 广告补丁 v8
  *
- * v7 修复两件事：
- * 1) v6 在 2 MB 级 /browse 上递归 slice/重建整个 protobuf，Surge JSC 会出现内存警告。
- *    v7 不再全树递归，只解析 Home Feed 必经的三层：
- *      top-level field #10 -> field #49399797 -> 直接 Feed item
- * 2) v5/v6 删除广告内部 payload 后，可能残留一个小型 EML 外壳，表现为首页灰/黑空框。
- *    v7 会删除完整广告 item，同时清理已知的残留空壳及相邻 divider。
+ * v8 修复 v7 的路径假设错误：YouTube 的 Home Feed 容器 field #49399797
+ * 不再固定出现在 top-level field #10；实测同一 App/账号可切换到
+ * field #9 -> 58173949 -> 1 -> 58174010 -> 4 -> 49399797。
  *
- * 所有检测都直接在原 Uint8Array 的区间上扫描，避免 TextEncoder 和大规模切片。
+ * 新策略：
+ * - 在前 8 层 protobuf 中低内存搜索 field #49399797；
+ * - 在该容器的直接子项中删除：
+ *   1) field #1 且命中 >=2 个广告端点的新 Feed Sponsored item；
+ *   2) field #32 且命中 >=2 个广告端点的旧 Feed Sponsored item；
+ *   3) v5/v6 可能留下的已知 EML 空壳；
+ * - 同时删除紧邻被删 item 的 cell_divider，避免灰/黑占位。
+ * - 使用 subarray/range segment，只有命中后才重建相关祖先，降低内存占用。
  */
 (() => {
+  const TARGET = 49399797;
+  const MAX_SEARCH_DEPTH = 8;
+
   const CORE = [
     'googleadservices.com/pagead/aclk',
     'www.youtube.com/pagead/adview',
@@ -18,13 +25,8 @@
     'www.youtube.com/aboutthisad'
   ];
 
-  const SHELL = [
-    'www.youtube.com/pcs/activeview',
-    'dynamic_reels_image_ad_tooltip_state',
-    'full_width_square_image_layout.eml-fe'
-  ];
-
   const TINY_LAYOUT = 'video_display_button_group_layout.eml-fe';
+  const PROMINENCE = 'home_vertical_feed_prominence_group_key';
   const DIVIDER = 'cell_divider.eml-fe';
   const NORMAL_THUMB = 'i.ytimg.com/vi/';
 
@@ -35,8 +37,8 @@
   }
 
   const coreBytes = CORE.map(ascii);
-  const shellBytes = SHELL.map(ascii);
   const tinyLayoutBytes = ascii(TINY_LAYOUT);
+  const prominenceBytes = ascii(PROMINENCE);
   const dividerBytes = ascii(DIVIDER);
   const normalThumbBytes = ascii(NORMAL_THUMB);
 
@@ -82,17 +84,9 @@
     return n;
   }
 
-  function anyShell(a, start, end) {
-    for (let i = 0; i < shellBytes.length; i++) {
-      if (containsRange(a, start, end, shellBytes[i])) return true;
-    }
-    return false;
-  }
-
   function parseFields(a, start, end) {
     const fields = [];
     let i = start;
-
     try {
       while (i < end) {
         const fieldStart = i;
@@ -101,13 +95,11 @@
         const keyEnd = kv[1];
         const fieldNo = Math.floor(key / 8);
         const wt = key & 7;
-
         if (!fieldNo || (wt !== 0 && wt !== 1 && wt !== 2 && wt !== 5)) return null;
 
         let payloadStart = keyEnd;
         let payloadEnd;
         let fieldEnd;
-
         if (wt === 0) {
           const vv = readVarint(a, keyEnd, end);
           payloadEnd = vv[1];
@@ -124,35 +116,19 @@
           payloadEnd = payloadStart + lv[0];
           fieldEnd = payloadEnd;
         }
-
         if (fieldEnd > end) return null;
-
-        fields.push({
-          no: fieldNo,
-          wt: wt,
-          start: fieldStart,
-          keyEnd: keyEnd,
-          ps: payloadStart,
-          pe: payloadEnd,
-          end: fieldEnd
-        });
-
+        fields.push({ no: fieldNo, wt, start: fieldStart, keyEnd, ps: payloadStart, pe: payloadEnd, end: fieldEnd });
         i = fieldEnd;
       }
-
       return i === end ? fields : null;
     } catch (_) {
       return null;
     }
   }
 
-  function rangeSeg(s, e) { return { s: s, e: e }; }
-  function bytesSeg(b) { return { b: b }; }
-
-  function segLen(seg) {
-    return seg.b ? seg.b.length : (seg.e - seg.s);
-  }
-
+  function rangeSeg(s, e) { return { s, e }; }
+  function bytesSeg(b) { return { b }; }
+  function segLen(x) { return x.b ? x.b.length : x.e - x.s; }
   function totalLen(segs) {
     let n = 0;
     for (let i = 0; i < segs.length; i++) n += segLen(segs[i]);
@@ -163,181 +139,134 @@
     const out = new Uint8Array(len);
     let p = 0;
     for (let i = 0; i < segs.length; i++) {
-      const seg = segs[i];
-      if (seg.b) {
-        out.set(seg.b, p);
-        p += seg.b.length;
+      const x = segs[i];
+      if (x.b) {
+        out.set(x.b, p);
+        p += x.b.length;
       } else {
-        const view = a.subarray(seg.s, seg.e);
-        out.set(view, p);
-        p += view.length;
+        const v = a.subarray(x.s, x.e);
+        out.set(v, p);
+        p += v.length;
       }
     }
     return out;
   }
 
-  function planGroup(a, start, end) {
+  function isShell(a, x) {
+    const size = x.pe - x.ps;
+    if (x.no !== 1 || size > 8192) return false;
+    if (containsRange(a, x.ps, x.pe, normalThumbBytes)) return false;
+    return containsRange(a, x.ps, x.pe, tinyLayoutBytes) &&
+           containsRange(a, x.ps, x.pe, prominenceBytes);
+  }
+
+  function rewriteFeedContainer(a, start, end) {
     const f = parseFields(a, start, end);
     if (!f) return null;
 
     const drop = {};
     let ads = 0;
     let shells = 0;
+    let dividers = 0;
 
     for (let i = 0; i < f.length; i++) {
       const x = f[i];
-      if (x.wt !== 2 || (x.no !== 1 && x.no !== 32)) continue;
+      if (x.wt !== 2) continue;
 
-      const size = x.pe - x.ps;
-      const hits = coreHits(a, x.ps, x.pe);
-
-      if (hits >= 2) {
-        drop[i] = true;
-        ads++;
-        console.log(`[YT HomeFeed AdBlock v7] DROP AD field=${x.no} bytes=${size} hits=${hits}`);
-        continue;
+      if (x.no === 1 || x.no === 32) {
+        const hits = coreHits(a, x.ps, x.pe);
+        if (hits >= 2) {
+          drop[i] = true;
+          ads++;
+          console.log(`[YT HomeFeed AdBlock v8] DROP AD field=${x.no} bytes=${x.pe - x.ps} hits=${hits}`);
+          continue;
+        }
       }
 
-      if (x.no === 1 && size <= 8192) {
-        let isShell = anyShell(a, x.ps, x.pe);
-
-        if (!isShell && size <= 2048 &&
-            containsRange(a, x.ps, x.pe, tinyLayoutBytes) &&
-            !containsRange(a, x.ps, x.pe, normalThumbBytes)) {
-          isShell = true;
-        }
-
-        if (isShell) {
-          drop[i] = true;
-          shells++;
-          console.log(`[YT HomeFeed AdBlock v7] DROP SHELL bytes=${size}`);
-        }
+      if (isShell(a, x)) {
+        drop[i] = true;
+        shells++;
+        console.log(`[YT HomeFeed AdBlock v8] DROP SHELL bytes=${x.pe - x.ps}`);
       }
     }
 
+    // 删除被移除 item 后面的 divider；保留前一个 divider，确保相邻正常视频仍有分隔。
     for (let i = 0; i < f.length; i++) {
       if (drop[i]) continue;
       const x = f[i];
-
-      if (x.wt === 2 && x.no === 1 && (x.pe - x.ps) <= 3000 &&
-          containsRange(a, x.ps, x.pe, dividerBytes) &&
-          (drop[i - 1] || drop[i + 1])) {
+      if (x.wt !== 2 || x.no !== 1 || (x.pe - x.ps) > 3000) continue;
+      if (!containsRange(a, x.ps, x.pe, dividerBytes)) continue;
+      if (drop[i - 1]) {
         drop[i] = true;
-        console.log(`[YT HomeFeed AdBlock v7] DROP DIVIDER bytes=${x.pe - x.ps}`);
+        dividers++;
+        console.log(`[YT HomeFeed AdBlock v8] DROP DIVIDER bytes=${x.pe - x.ps}`);
       }
     }
 
     if (ads === 0 && shells === 0) {
-      return { changed: false, segs: [rangeSeg(start, end)], len: end - start, ads: 0, shells: 0 };
+      return { changed: false, segs: [rangeSeg(start, end)], len: end - start, ads: 0, shells: 0, dividers: 0 };
     }
 
     const segs = [];
     for (let i = 0; i < f.length; i++) {
       if (!drop[i]) segs.push(rangeSeg(f[i].start, f[i].end));
     }
-
-    return {
-      changed: true,
-      segs: segs,
-      len: totalLen(segs),
-      ads: ads,
-      shells: shells
-    };
+    return { changed: true, segs, len: totalLen(segs), ads, shells, dividers };
   }
 
-  function planField10(a, start, end) {
+  // 在任意前 8 层 message 中寻找 field #49399797；命中后只重建该分支。
+  function rewriteSearch(a, start, end, depth) {
     const f = parseFields(a, start, end);
     if (!f) return null;
 
-    const segs = [];
     let changed = false;
     let ads = 0;
     let shells = 0;
-
-    for (let i = 0; i < f.length; i++) {
-      const x = f[i];
-
-      if (x.wt === 2 && x.no === 49399797) {
-        const gp = planGroup(a, x.ps, x.pe);
-        if (gp && gp.changed) {
-          segs.push(rangeSeg(x.start, x.keyEnd));
-          segs.push(bytesSeg(varintBytes(gp.len)));
-          for (let j = 0; j < gp.segs.length; j++) segs.push(gp.segs[j]);
-          changed = true;
-          ads += gp.ads;
-          shells += gp.shells;
-          continue;
-        }
-      }
-
-      segs.push(rangeSeg(x.start, x.end));
-    }
-
-    return {
-      changed: changed,
-      segs: segs,
-      len: totalLen(segs),
-      ads: ads,
-      shells: shells
-    };
-  }
-
-  function planTop(a) {
-    const f = parseFields(a, 0, a.length);
-    if (!f) return null;
-
+    let dividers = 0;
     const segs = [];
-    let changed = false;
-    let ads = 0;
-    let shells = 0;
 
     for (let i = 0; i < f.length; i++) {
       const x = f[i];
+      let child = null;
 
-      if (x.wt === 2 && x.no === 10) {
-        const hp = planField10(a, x.ps, x.pe);
-        if (hp && hp.changed) {
-          segs.push(rangeSeg(x.start, x.keyEnd));
-          segs.push(bytesSeg(varintBytes(hp.len)));
-          for (let j = 0; j < hp.segs.length; j++) segs.push(hp.segs[j]);
-          changed = true;
-          ads += hp.ads;
-          shells += hp.shells;
-          continue;
-        }
+      if (x.wt === 2 && x.no === TARGET) {
+        child = rewriteFeedContainer(a, x.ps, x.pe);
+      } else if (x.wt === 2 && depth < MAX_SEARCH_DEPTH) {
+        const probe = parseFields(a, x.ps, x.pe);
+        if (probe) child = rewriteSearch(a, x.ps, x.pe, depth + 1);
       }
 
-      segs.push(rangeSeg(x.start, x.end));
+      if (child && child.changed) {
+        segs.push(rangeSeg(x.start, x.keyEnd));
+        segs.push(bytesSeg(varintBytes(child.len)));
+        for (let j = 0; j < child.segs.length; j++) segs.push(child.segs[j]);
+        changed = true;
+        ads += child.ads;
+        shells += child.shells;
+        dividers += child.dividers;
+      } else {
+        segs.push(rangeSeg(x.start, x.end));
+      }
     }
 
-    return {
-      changed: changed,
-      segs: segs,
-      len: totalLen(segs),
-      ads: ads,
-      shells: shells
-    };
+    return { changed, segs, len: totalLen(segs), ads, shells, dividers };
   }
 
   try {
-    const input = $response.body instanceof Uint8Array
-      ? $response.body
-      : new Uint8Array($response.body);
+    const input = $response.body instanceof Uint8Array ? $response.body : new Uint8Array($response.body);
+    console.log(`[YT HomeFeed AdBlock v8] START bytes=${input.length}`);
 
-    console.log(`[YT HomeFeed AdBlock v7] START bytes=${input.length}`);
-
-    const plan = planTop(input);
-
+    const plan = rewriteSearch(input, 0, input.length, 0);
     if (plan && plan.changed) {
       const out = emit(input, plan.segs, plan.len);
-      console.log(`[YT HomeFeed AdBlock v7] DONE ads=${plan.ads} shells=${plan.shells}, ${input.length} -> ${out.length}`);
+      console.log(`[YT HomeFeed AdBlock v8] DONE ads=${plan.ads} shells=${plan.shells} dividers=${plan.dividers}, ${input.length} -> ${out.length}`);
       $done({ body: out });
     } else {
-      console.log(`[YT HomeFeed AdBlock v7] PASS bytes=${input.length}`);
+      console.log(`[YT HomeFeed AdBlock v8] PASS bytes=${input.length}`);
       $done({});
     }
   } catch (e) {
-    console.log(`[YT HomeFeed AdBlock v7] ERROR ${e}`);
+    console.log(`[YT HomeFeed AdBlock v8] ERROR ${e}`);
     $done({});
   }
 })();
