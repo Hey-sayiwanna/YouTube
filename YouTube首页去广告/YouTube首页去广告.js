@@ -1,28 +1,34 @@
 /*
- * YouTube iOS 首页 Feed Sponsored 广告补丁 v8
+ * YouTube iOS 首页 Feed Sponsored 广告补丁 v9
  *
- * v8 修复 v7 的路径假设错误：YouTube 的 Home Feed 容器 field #49399797
- * 不再固定出现在 top-level field #10；实测同一 App/账号可切换到
- * field #9 -> 58173949 -> 1 -> 58174010 -> 4 -> 49399797。
+ * v9 修复 v8 对广告端点特征判断过窄的问题。
+ * 新抓到的 MyRepublic Sponsored item 仍位于 field #49399797 下的 field #1，
+ * 但不再携带旧的 googleadservices.com/pagead/aclk、/pagead/adview 等组合，
+ * 而是改成 paralleladinteraction、googleads.g.doubleclick.net/pagead/interaction，
+ * 同时仍稳定带有 www.youtube.com/aboutthisad 与 yt3.ggpht.com/proxy。
  *
  * 新策略：
- * - 在前 8 层 protobuf 中低内存搜索 field #49399797；
- * - 在该容器的直接子项中删除：
- *   1) field #1 且命中 >=2 个广告端点的新 Feed Sponsored item；
- *   2) field #32 且命中 >=2 个广告端点的旧 Feed Sponsored item；
- *   3) v5/v6 可能留下的已知 EML 空壳；
- * - 同时删除紧邻被删 item 的 cell_divider，避免灰/黑占位。
- * - 使用 subarray/range segment，只有命中后才重建相关祖先，降低内存占用。
+ * - 继续在前 8 层寻找 Home Feed 容器 field #49399797；
+ * - 对直接 field #1 / #32 item：
+ *   1) 只要包含 www.youtube.com/aboutthisad，直接判定为 Sponsored；
+ *   2) 或者命中 >=2 个广告家族特征（pagead、doubleclick pagead、yt3 proxy、旧端点）；
+ * - 删除整条广告 item 及其后 divider，避免空白/黑框；
+ * - 保留 WebView 引擎与低内存 range/subarray 重建方式。
  */
 (() => {
   const TARGET = 49399797;
   const MAX_SEARCH_DEPTH = 8;
 
-  const CORE = [
+  const ABOUT = 'www.youtube.com/aboutthisad';
+  const OLD_CORE = [
     'googleadservices.com/pagead/aclk',
     'www.youtube.com/pagead/adview',
-    'www.youtube.com/pagead/interaction',
-    'www.youtube.com/aboutthisad'
+    'www.youtube.com/pagead/interaction'
+  ];
+  const BROAD = [
+    'www.youtube.com/pagead/',
+    'googleads.g.doubleclick.net/pagead/',
+    'yt3.ggpht.com/proxy'
   ];
 
   const TINY_LAYOUT = 'video_display_button_group_layout.eml-fe';
@@ -36,7 +42,9 @@
     return out;
   }
 
-  const coreBytes = CORE.map(ascii);
+  const aboutBytes = ascii(ABOUT);
+  const oldBytes = OLD_CORE.map(ascii);
+  const broadBytes = BROAD.map(ascii);
   const tinyLayoutBytes = ascii(TINY_LAYOUT);
   const prominenceBytes = ascii(PROMINENCE);
   const dividerBytes = ascii(DIVIDER);
@@ -76,12 +84,20 @@
     return false;
   }
 
-  function coreHits(a, start, end) {
-    let n = 0;
-    for (let i = 0; i < coreBytes.length; i++) {
-      if (containsRange(a, start, end, coreBytes[i])) n++;
+  function adEvidence(a, start, end) {
+    if (containsRange(a, start, end, aboutBytes)) {
+      return { ad: true, reason: 'aboutthisad', hits: 4 };
     }
-    return n;
+
+    let hits = 0;
+    for (let i = 0; i < oldBytes.length; i++) {
+      if (containsRange(a, start, end, oldBytes[i])) hits++;
+    }
+    for (let i = 0; i < broadBytes.length; i++) {
+      if (containsRange(a, start, end, broadBytes[i])) hits++;
+    }
+
+    return { ad: hits >= 2, reason: 'markers', hits };
   }
 
   function parseFields(a, start, end) {
@@ -174,11 +190,11 @@
       if (x.wt !== 2) continue;
 
       if (x.no === 1 || x.no === 32) {
-        const hits = coreHits(a, x.ps, x.pe);
-        if (hits >= 2) {
+        const ev = adEvidence(a, x.ps, x.pe);
+        if (ev.ad) {
           drop[i] = true;
           ads++;
-          console.log(`[YT HomeFeed AdBlock v8] DROP AD field=${x.no} bytes=${x.pe - x.ps} hits=${hits}`);
+          console.log(`[YT HomeFeed AdBlock v9] DROP AD field=${x.no} bytes=${x.pe - x.ps} hits=${ev.hits} reason=${ev.reason}`);
           continue;
         }
       }
@@ -186,11 +202,10 @@
       if (isShell(a, x)) {
         drop[i] = true;
         shells++;
-        console.log(`[YT HomeFeed AdBlock v8] DROP SHELL bytes=${x.pe - x.ps}`);
+        console.log(`[YT HomeFeed AdBlock v9] DROP SHELL bytes=${x.pe - x.ps}`);
       }
     }
 
-    // 删除被移除 item 后面的 divider；保留前一个 divider，确保相邻正常视频仍有分隔。
     for (let i = 0; i < f.length; i++) {
       if (drop[i]) continue;
       const x = f[i];
@@ -199,7 +214,7 @@
       if (drop[i - 1]) {
         drop[i] = true;
         dividers++;
-        console.log(`[YT HomeFeed AdBlock v8] DROP DIVIDER bytes=${x.pe - x.ps}`);
+        console.log(`[YT HomeFeed AdBlock v9] DROP DIVIDER bytes=${x.pe - x.ps}`);
       }
     }
 
@@ -214,7 +229,6 @@
     return { changed: true, segs, len: totalLen(segs), ads, shells, dividers };
   }
 
-  // 在任意前 8 层 message 中寻找 field #49399797；命中后只重建该分支。
   function rewriteSearch(a, start, end, depth) {
     const f = parseFields(a, start, end);
     if (!f) return null;
@@ -254,19 +268,19 @@
 
   try {
     const input = $response.body instanceof Uint8Array ? $response.body : new Uint8Array($response.body);
-    console.log(`[YT HomeFeed AdBlock v8] START bytes=${input.length}`);
+    console.log(`[YT HomeFeed AdBlock v9] START bytes=${input.length}`);
 
     const plan = rewriteSearch(input, 0, input.length, 0);
     if (plan && plan.changed) {
       const out = emit(input, plan.segs, plan.len);
-      console.log(`[YT HomeFeed AdBlock v8] DONE ads=${plan.ads} shells=${plan.shells} dividers=${plan.dividers}, ${input.length} -> ${out.length}`);
+      console.log(`[YT HomeFeed AdBlock v9] DONE ads=${plan.ads} shells=${plan.shells} dividers=${plan.dividers}, ${input.length} -> ${out.length}`);
       $done({ body: out });
     } else {
-      console.log(`[YT HomeFeed AdBlock v8] PASS bytes=${input.length}`);
+      console.log(`[YT HomeFeed AdBlock v9] PASS bytes=${input.length}`);
       $done({});
     }
   } catch (e) {
-    console.log(`[YT HomeFeed AdBlock v8] ERROR ${e}`);
+    console.log(`[YT HomeFeed AdBlock v9] ERROR ${e}`);
     $done({});
   }
 })();
