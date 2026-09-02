@@ -1,14 +1,14 @@
 #!name=YouTube首页去广告
-#!desc=针对 iOS YouTube 首页推荐流 Sponsored/Feed 广告的定向补丁。v3 进一步清除主体广告项与 field #777 中残留的 EML 广告组件注册表；仅接管 /youtubei/v1/browse，可与现有 YouTube Enhance、双语字幕模块共存。
+#!desc=针对 iOS YouTube 首页推荐流 Sponsored/Feed 广告的定向补丁。v4 仅清除中小型强广告 protobuf 子块，不再删除整页 Feed 外层容器；已开启调试日志，便于确认是否真正命中过滤。
 #!category=YouTube
 #!system=ios
-#!version=2026.09.02.3
+#!version=2026.09.02.4
 
 [Rule]
 AND,((DOMAIN,youtubei.googleapis.com),(PROTOCOL,UDP)),REJECT
 
 [Script]
-YouTube.HomeFeedAdBlock.v3 = type=http-response,pattern=^https:\/\/youtubei\.googleapis\.com\/youtubei\/v1\/browse(\?.*)?$,requires-body=1,max-size=-1,binary-body-mode=1,engine=jsc,script-path=https://raw.githubusercontent.com/Hey-sayiwanna/YouTube/main/YouTube%E9%A6%96%E9%A1%B5%E5%8E%BB%E5%B9%BF%E5%91%8A/YouTube%E9%A6%96%E9%A1%B5%E5%8E%BB%E5%B9%BF%E5%91%8A.js?v=20260902.3
+YouTube.HomeFeedAdBlock.v4 = type=http-response,pattern=^https:\/\/youtubei\.googleapis\.com\/youtubei\/v1\/browse(\?.*)?$,requires-body=1,max-size=-1,binary-body-mode=1,engine=jsc,debug=true,script-path=https://raw.githubusercontent.com/Hey-sayiwanna/YouTube/main/YouTube%E9%A6%96%E9%A1%B5%E5%8E%BB%E5%B9%BF%E5%91%8A/YouTube%E9%A6%96%E9%A1%B5%E5%8E%BB%E5%B9%BF%E5%91%8A.js?v=20260902.4
 
 [MITM]
 hostname = %APPEND% youtubei.googleapis.com
