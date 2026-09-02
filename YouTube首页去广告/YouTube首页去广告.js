@@ -1,15 +1,13 @@
 /*
- * YouTube iOS 首页 Feed Sponsored 广告定向补丁 v5
+ * YouTube iOS 首页 Feed Sponsored 广告定向补丁 v6
  *
- * v5 修复 Surge JSC 环境没有 TextEncoder 导致脚本直接 Abort 的问题。
- * 过滤策略沿用 v4：
- * - 不把 /browse 整体返回 0；
- * - 不删除整页 Feed 外层大容器；
- * - 仅递归删除 <= 40 KB 且同时命中 >= 2 个强广告端点标记的 protobuf 子消息；
- * - 标记均为 ASCII，使用手写 ASCII -> Uint8Array 转换，兼容 Surge JSC。
+ * v5 已能删除广告内部的创意/点击子节点，但会留下外层 Feed 卡片容器，
+ * 导致首页出现灰色/黑色空框。
+ * v6 改为：识别包含 >=2 个强广告端点标记的完整 Feed item（field #5），
+ * 直接删除整个 item，而不是只删除内部 field #7/#8。
+ * 这样广告卡片本身不会进入客户端布局，自然也不会留下空白占位。
  */
 (() => {
-  const MAX_AD_NODE_SIZE = 40 * 1024;
   const CORE_MARKERS = [
     'googleadservices.com/pagead/aclk',
     'www.youtube.com/pagead/adview',
@@ -118,7 +116,9 @@
         if (wt === 0) {
           const [, e] = readVarint(a, keyEnd, a.length);
           const raw = a.slice(fieldStart, e);
-          parts.push(raw); total += raw.length; i = e;
+          parts.push(raw);
+          total += raw.length;
+          i = e;
           continue;
         }
 
@@ -126,7 +126,9 @@
           const e = keyEnd + (wt === 1 ? 8 : 4);
           if (e > a.length) return null;
           const raw = a.slice(fieldStart, e);
-          parts.push(raw); total += raw.length; i = e;
+          parts.push(raw);
+          total += raw.length;
+          i = e;
           continue;
         }
 
@@ -135,11 +137,13 @@
         if (payloadEnd > a.length) return null;
         const payload = a.slice(lenEnd, payloadEnd);
 
-        if (payload.length <= MAX_AD_NODE_SIZE) {
+        // 真实 HAR 中 Sponsored 卡片的完整 Feed item 均落在 field #5。
+        // 只有同时命中 >=2 个强广告端点时才删除，避免误伤普通推荐。
+        if (fieldNo === 5 && payload.length >= 512) {
           const hits = markerHits(payload);
           if (hits >= 2) {
             removed++;
-            console.log(`[YT HomeFeed AdBlock v5] PRUNE field=${fieldNo} depth=${depth} bytes=${payload.length} hits=${hits}`);
+            console.log(`[YT HomeFeed AdBlock v6] DROP ITEM field=5 depth=${depth} bytes=${payload.length} hits=${hits}`);
             i = payloadEnd;
             continue;
           }
@@ -163,7 +167,8 @@
           removed += childRemoved;
         } else {
           const raw = a.slice(fieldStart, payloadEnd);
-          parts.push(raw); total += raw.length;
+          parts.push(raw);
+          total += raw.length;
         }
         i = payloadEnd;
       }
@@ -179,18 +184,18 @@
       ? $response.body
       : new Uint8Array($response.body);
 
-    console.log(`[YT HomeFeed AdBlock v5] START bytes=${input.length}`);
+    console.log(`[YT HomeFeed AdBlock v6] START bytes=${input.length}`);
     const result = cleanMessage(input, 0);
 
     if (result && result.removed > 0) {
-      console.log(`[YT HomeFeed AdBlock v5] DONE removed=${result.removed}, ${input.length} -> ${result.bytes.length} bytes`);
+      console.log(`[YT HomeFeed AdBlock v6] DONE items=${result.removed}, ${input.length} -> ${result.bytes.length} bytes`);
       $done({ body: result.bytes });
     } else {
-      console.log(`[YT HomeFeed AdBlock v5] PASS no ad node, bytes=${input.length}`);
+      console.log(`[YT HomeFeed AdBlock v6] PASS no sponsored item, bytes=${input.length}`);
       $done({});
     }
   } catch (e) {
-    console.log(`[YT HomeFeed AdBlock v5] ERROR ${e}`);
+    console.log(`[YT HomeFeed AdBlock v6] ERROR ${e}`);
     $done({});
   }
 })();
