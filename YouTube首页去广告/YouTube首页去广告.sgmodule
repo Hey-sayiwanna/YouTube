@@ -1,14 +1,14 @@
 #!name=YouTube首页去广告
-#!desc=针对 iOS YouTube 首页推荐流 Sponsored/Feed 广告的定向补丁。v6 改为删除完整广告 Feed item，解决 v5 删除广告内容后留下灰色/黑色空框的问题；仅接管 /youtubei/v1/browse，可与现有 YouTube Enhance、双语字幕模块共存。
+#!desc=针对 iOS YouTube 首页推荐流 Sponsored/Feed 广告的定向补丁。v7 改为低内存三层定向解析，直接删除完整广告 Feed item，并清理 v5/v6 可能留下的 EML 灰/黑空框；同时切换 WebView 引擎，避免 JSC 内存告警。仅接管 /youtubei/v1/browse，可与现有 YouTube Enhance、双语字幕模块共存。
 #!category=YouTube
 #!system=ios
-#!version=2026.09.02.6
+#!version=2026.09.02.7
 
 [Rule]
 AND,((DOMAIN,youtubei.googleapis.com),(PROTOCOL,UDP)),REJECT
 
 [Script]
-YouTube.HomeFeedAdBlock.v6 = type=http-response,pattern=^https:\/\/youtubei\.googleapis\.com\/youtubei\/v1\/browse(\?.*)?$,requires-body=1,max-size=-1,binary-body-mode=1,engine=jsc,debug=true,script-path=https://raw.githubusercontent.com/Hey-sayiwanna/YouTube/main/YouTube%E9%A6%96%E9%A1%B5%E5%8E%BB%E5%B9%BF%E5%91%8A/YouTube%E9%A6%96%E9%A1%B5%E5%8E%BB%E5%B9%BF%E5%91%8A.js?v=20260902.6
+YouTube.HomeFeedAdBlock.v7 = type=http-response,pattern=^https:\/\/youtubei\.googleapis\.com\/youtubei\/v1\/browse(\?.*)?$,requires-body=1,max-size=-1,binary-body-mode=1,engine=webview,debug=true,script-path=https://raw.githubusercontent.com/Hey-sayiwanna/YouTube/main/YouTube%E9%A6%96%E9%A1%B5%E5%8E%BB%E5%B9%BF%E5%91%8A/YouTube%E9%A6%96%E9%A1%B5%E5%8E%BB%E5%B9%BF%E5%91%8A.js?v=20260902.7
 
 [MITM]
 hostname = %APPEND% youtubei.googleapis.com
